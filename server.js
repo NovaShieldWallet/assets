@@ -8,6 +8,9 @@ const PORT = process.env.PORT || 3000;
 const HELIUS_RPC_URL = 'https://mainnet.helius-rpc.com/?api-key=bdafb51b-3059-4f6e-a2a3-5b4669dc5937';
 const SOLANA_CHAIN = 'solana';
 const TOKENLIST_DIR = path.join(__dirname, 'tokenlists');
+const BLOCKCHAINS_DIR = path.join(__dirname, 'blockchains');
+const SOLANA_ASSETS_DIR = path.join(BLOCKCHAINS_DIR, SOLANA_CHAIN, 'assets');
+const SOLANA_LOGO_FILENAME = 'logo.png';
 
 // Enable CORS for all routes
 app.use(cors());
@@ -130,6 +133,157 @@ function mapHeliusAssetToResponse(mintAddress, heliusAsset) {
   };
 }
 
+function buildLocalSolanaLogoURI(tokenId) {
+  return `/blockchains/${SOLANA_CHAIN}/assets/${tokenId}/${SOLANA_LOGO_FILENAME}`;
+}
+
+function normalizeLogoUri(uri) {
+  if (!uri || typeof uri !== 'string') {
+    return null;
+  }
+  if (uri.startsWith('ipfs://')) {
+    return `https://ipfs.io/ipfs/${uri.slice('ipfs://'.length)}`;
+  }
+  if (uri.startsWith('ar://')) {
+    return `https://arweave.net/${uri.slice('ar://'.length)}`;
+  }
+  return uri;
+}
+
+async function cacheSolanaLogo(asset) {
+  const normalizedUri = normalizeLogoUri(asset.logoURI);
+  if (!normalizedUri) {
+    return null;
+  }
+
+  const tokenDir = path.join(SOLANA_ASSETS_DIR, asset.tokenId);
+  const logoPath = path.join(tokenDir, SOLANA_LOGO_FILENAME);
+
+  try {
+    await fs.access(logoPath);
+    return buildLocalSolanaLogoURI(asset.tokenId);
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      throw err;
+    }
+  }
+
+  await fs.mkdir(tokenDir, { recursive: true });
+
+  if (normalizedUri.startsWith('data:')) {
+    const separatorIndex = normalizedUri.indexOf(',');
+    if (separatorIndex === -1) {
+      return null;
+    }
+    const metadataSection = normalizedUri.slice(5, separatorIndex);
+    const isBase64 = metadataSection.includes(';base64');
+    const dataSection = normalizedUri.slice(separatorIndex + 1);
+    const buffer = Buffer.from(dataSection, isBase64 ? 'base64' : 'utf-8');
+    await fs.writeFile(logoPath, buffer);
+    return buildLocalSolanaLogoURI(asset.tokenId);
+  }
+
+  const response = await fetch(normalizedUri);
+  if (!response.ok) {
+    throw new Error(`Logo download failed with status ${response.status}`);
+  }
+  const buffer = Buffer.from(await response.arrayBuffer());
+  await fs.writeFile(logoPath, buffer);
+  return buildLocalSolanaLogoURI(asset.tokenId);
+}
+
+async function readTokenListPayload(chain) {
+  const tokenListPath = path.join(TOKENLIST_DIR, `${chain}.json`);
+  try {
+    const contents = await fs.readFile(tokenListPath, 'utf-8');
+    const parsed = JSON.parse(contents);
+    if (!Array.isArray(parsed.assets)) {
+      parsed.assets = [];
+    }
+    if (typeof parsed.version !== 'number') {
+      parsed.version = 1;
+    }
+    return { payload: parsed, tokenListPath };
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      return {
+        payload: { version: 1, assets: [] },
+        tokenListPath
+      };
+    }
+    throw err;
+  }
+}
+
+function sanitizeAssetForTokenList(asset) {
+  const base = {
+    chain: SOLANA_CHAIN,
+    tokenId: asset.tokenId,
+    name: asset.name,
+    symbol: asset.symbol,
+    type: asset.type || 'SPL',
+    decimals: typeof asset.decimals === 'number' ? asset.decimals : 0
+  };
+
+  if (asset.logoURI) {
+    base.logoURI = asset.logoURI;
+  }
+
+  if (asset.supply) {
+    base.supply = asset.supply;
+  }
+
+  return base;
+}
+
+async function upsertSolanaTokenList(asset) {
+  const { payload, tokenListPath } = await readTokenListPayload(SOLANA_CHAIN);
+  const assets = payload.assets;
+  const existing = findAssetInList(assets, SOLANA_CHAIN, asset.tokenId);
+
+  if (existing) {
+    const sanitized = sanitizeAssetForTokenList(asset);
+    let shouldPersist = false;
+    Object.entries(sanitized).forEach(([key, value]) => {
+      if (value === undefined) {
+        return;
+      }
+      if (existing[key] !== value) {
+        existing[key] = value;
+        shouldPersist = true;
+      }
+    });
+
+    if (shouldPersist) {
+      await fs.writeFile(tokenListPath, `${JSON.stringify(payload, null, 4)}\n`, 'utf-8');
+    }
+    return;
+  }
+
+  assets.push(sanitizeAssetForTokenList(asset));
+  await fs.writeFile(tokenListPath, `${JSON.stringify(payload, null, 4)}\n`, 'utf-8');
+}
+
+async function persistSolanaAsset(asset) {
+  const updatedAsset = { ...asset };
+  try {
+    const localLogoUri = await cacheSolanaLogo(updatedAsset);
+    if (localLogoUri) {
+      updatedAsset.logoURI = localLogoUri;
+    }
+  } catch (err) {
+    console.error(`Failed to cache logo for ${asset.tokenId}:`, err.message);
+  }
+
+  try {
+    await upsertSolanaTokenList(updatedAsset);
+  } catch (err) {
+    console.error(`Failed to update Solana token list for ${asset.tokenId}:`, err.message);
+  }
+
+  return updatedAsset;
+}
+
 app.get('/api/assets/:chain/:tokenId', async (req, res) => {
   const chain = req.params.chain.toLowerCase();
   const { tokenId } = req.params;
@@ -145,7 +299,8 @@ app.get('/api/assets/:chain/:tokenId', async (req, res) => {
       const heliusAsset = await fetchHeliusMetadata(tokenId);
       const mappedAsset = mapHeliusAssetToResponse(tokenId, heliusAsset);
       if (mappedAsset) {
-        return res.json(mappedAsset);
+        const persisted = await persistSolanaAsset(mappedAsset);
+        return res.json(persisted);
       }
     }
 
