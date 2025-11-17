@@ -24,7 +24,16 @@
             "symbol": "FIDO",
             "type": "SPL",
             "decimals": 6
+        },
+        {
+            "chain": "solana",
+            "tokenId": "DjCSdzrHPFfVJixswpP4FdeVDmaqeHRoJPrnZubSpump",
+            "name": "The signs of a bubble",
+            "symbol": "BUBBLE",
+            "type": "SPL",
+            "decimals": 6,
+            "logoURI": "/blockchains/solana/assets/DjCSdzrHPFfVJixswpP4FdeVDmaqeHRoJPrnZubSpump/logo.png",
+            "supply": "999758698622446"
         }
     ]
 }
-

@@ -316,6 +316,122 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
+// Fallback middleware for missing static assets - fetch from Trust Wallet CDN
+app.use(async (req, res, next) => {
+  // Only handle requests for blockchain assets (images)
+  const assetPathMatch = req.path.match(/^\/blockchains\/([^/]+)\/assets\/([^/]+)\/(logo\.(png|svg))$/);
+  if (!assetPathMatch) {
+    return next();
+  }
+
+  const [, chain, tokenId, filename] = assetPathMatch;
+  const localPath = path.join(__dirname, req.path);
+
+  try {
+    // Check if file exists locally
+    await fs.access(localPath);
+    // File exists, let express.static handle it (shouldn't reach here, but just in case)
+    return next();
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      // Unexpected error
+      console.error(`Error checking local file ${localPath}:`, err);
+      return next();
+    }
+    // File doesn't exist locally, try Trust Wallet CDN
+  }
+
+  // Try fetching from Trust Wallet CDN first
+  const trustWalletUrl = `https://assets-cdn.trustwallet.com${req.path}`;
+  
+  try {
+    console.log(`Fetching from Trust Wallet CDN: ${trustWalletUrl}`);
+    const response = await fetch(trustWalletUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; Assets-Server/1.0)'
+      }
+    });
+
+    if (response.ok) {
+      // Successfully fetched from CDN
+      const buffer = Buffer.from(await response.arrayBuffer());
+      const contentType = response.headers.get('content-type') || 
+        (filename.endsWith('.png') ? 'image/png' : 'image/svg+xml');
+      
+      // Cache headers
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Cache-Control', 'public, max-age=86400'); // 24 hours
+      res.setHeader('X-Cached-From', 'trustwallet-cdn');
+      
+      // Optionally cache locally for future requests (async, don't wait)
+      const tokenDir = path.join(BLOCKCHAINS_DIR, chain, 'assets', tokenId);
+      fs.mkdir(tokenDir, { recursive: true })
+        .then(() => fs.writeFile(localPath, buffer))
+        .then(() => console.log(`Cached locally: ${localPath}`))
+        .catch(err => console.error(`Failed to cache locally ${localPath}:`, err.message));
+      
+      return res.send(buffer);
+    } else {
+      console.log(`Trust Wallet CDN returned ${response.status} for ${trustWalletUrl}`);
+    }
+  } catch (err) {
+    console.error(`Error fetching from Trust Wallet CDN ${trustWalletUrl}:`, err.message);
+  }
+
+  // If Trust Wallet CDN failed, try fetching from Helius metadata for Solana tokens
+  if (chain === SOLANA_CHAIN) {
+    try {
+      console.log(`Attempting to fetch Solana token metadata for ${tokenId}`);
+      const heliusAsset = await fetchHeliusMetadata(tokenId);
+      if (heliusAsset) {
+        const mappedAsset = mapHeliusAssetToResponse(tokenId, heliusAsset);
+        if (mappedAsset && mappedAsset.logoURI) {
+          const normalizedUri = normalizeLogoUri(mappedAsset.logoURI);
+          if (normalizedUri) {
+            console.log(`Fetching logo from metadata URI: ${normalizedUri}`);
+            const logoResponse = await fetch(normalizedUri, {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (compatible; Assets-Server/1.0)'
+              }
+            });
+
+            if (logoResponse.ok) {
+              const buffer = Buffer.from(await logoResponse.arrayBuffer());
+              const contentType = logoResponse.headers.get('content-type') || 
+                (filename.endsWith('.png') ? 'image/png' : 'image/svg+xml');
+              
+              // Cache headers
+              res.setHeader('Content-Type', contentType);
+              res.setHeader('Cache-Control', 'public, max-age=86400'); // 24 hours
+              res.setHeader('X-Cached-From', 'helius-metadata');
+              
+              // Cache locally and update token list (async, don't wait)
+              const tokenDir = path.join(BLOCKCHAINS_DIR, chain, 'assets', tokenId);
+              fs.mkdir(tokenDir, { recursive: true })
+                .then(() => fs.writeFile(localPath, buffer))
+                .then(() => {
+                  console.log(`Cached locally: ${localPath}`);
+                  // Update token list with the asset
+                  return persistSolanaAsset(mappedAsset);
+                })
+                .catch(err => console.error(`Failed to cache locally ${localPath}:`, err.message));
+              
+              return res.send(buffer);
+            } else {
+              console.log(`Failed to fetch logo from metadata URI ${normalizedUri}: ${logoResponse.status}`);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`Error fetching from Helius metadata for ${tokenId}:`, err.message);
+    }
+  }
+
+  // All fallbacks failed
+  return next();
+});
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ error: 'Asset not found' });
